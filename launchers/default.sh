@@ -13,9 +13,7 @@ dt-launchfile-init
 # NOTE: Use `dt-exec COMMAND` to run the main process (blocking process)
 
 # launching app
-roscore &
-sleep 5
-dt-exec rosrun lmpc controller.py
+roslaunch lmpc launcher.launch veh:=$VEHICLE_NAME
 
 
 # ----------------------------------------------------------------------------

@@ -28,3 +28,14 @@ catkin_package(
    CATKIN_DEPENDS message_runtime
 #  DEPENDS system_lib
 )
+
+include_directories(
+# include
+  ${catkin_INCLUDE_DIRS}
+)
+
+catkin_install_python(PROGRAMS
+  src/localize.py
+  src/get_map.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+ )

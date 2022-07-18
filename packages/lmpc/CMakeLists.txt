@@ -10,6 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
 add_message_files(
   FILES
   DuckPose.msg
+  Floats.msg
 )
 
 add_service_files(
@@ -37,5 +38,7 @@ include_directories(
 catkin_install_python(PROGRAMS
   src/localize.py
   src/get_map.py
+  src/blind_get_map.py
+  src/blind_controller.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )

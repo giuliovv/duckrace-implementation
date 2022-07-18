@@ -1,4 +1,3 @@
 casadi
 numpy
-opencv-python
 scikit-learn

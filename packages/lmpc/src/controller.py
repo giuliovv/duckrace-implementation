@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 
 import os
-import rospy
-from duckietown.dtros import DTROS, NodeType
-import os, rospkg
-rp = rospkg.RosPack()
-
-from lmpc.msg import DuckPose
-from lmpc.srv import GetMap
-from duckietown_msgs.msg import WheelsCmdStamped
 
 import casadi as ca
 import numpy as np
 from scipy import spatial
+
+# ROS
+import rospy, rospkg
+rp = rospkg.RosPack()
+
+# Msgs
+from lmpc.msg import DuckPose
+from lmpc.msg import Floats
+from duckietown_msgs.msg import WheelsCmdStamped
+
+# Duckie
+from dt_communication_utils import DTCommunicationGroup
+from duckietown.dtros import DTROS, NodeType
 
 
 lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "LMPC.casadi")
@@ -22,18 +27,31 @@ MPC = ca.Function.load(mpc_path)
 delay = round(0.15/0.1)
 u_delay0 = ca.DM(np.zeros((2, delay)))
 
-def get_map_client():
-    rospy.loginfo("[Controller]: Waiting for map server...")
-    print("[Controller]: Waiting for map server...")
-    rospy.wait_for_service('duckwalker/get_map')
-    try:
-        get_map = rospy.ServiceProxy('duckwalker/get_map', GetMap)
-        resp1 = get_map()
-        rospy.loginfo("Got map.")
-        print("Got map.")
-        return np.array(resp1.data).reshape(-1, 2)
-    except rospy.ServiceException as e:
-        print("Service call failed: %s"%e)
+group = DTCommunicationGroup('my_group', DuckPose)
+group_map = DTCommunicationGroup('map', DuckPose)
+
+ROS_SUB = False
+
+class GetMap():
+
+    def __init__(self):
+        self.map
+        group_map.subscribe(self.map_callback)
+
+    def map_callback(self, msg):
+        self.map = msg
+        print("[Controller]: Got map.")
+        rospy.loginfo("[Controller]: Got map.")
+
+    def wait_for_map(self):
+        print("[Controller]: Getting map...")
+        rospy.loginfo("[Controller]: Getting map...")
+        while self.map is None:
+            rospy.sleep(0.1)
+        group_map.shutdown()
+        print("[Controller]: Map saved.")
+        rospy.loginfo("[Controller]: Map saved.")
+        return self.map
 
 class TheController(DTROS):
 
@@ -47,8 +65,11 @@ class TheController(DTROS):
         # construct publisher
         self.pub = rospy.Publisher(f"/{self.vehicle}/wheels_driver_node/wheels_cmd", WheelsCmdStamped, queue_size=10)
         # Subscriber
-        self.subscriber = rospy.Subscriber("/watchtower00/localization",
-            DuckPose, self.callback,  queue_size=1)
+        if ROS_SUB:
+            self.subscriber = rospy.Subscriber("/watchtower00/localization",
+                DuckPose, self.callback,  queue_size=1)
+        else:
+            self.subscriber = group.Subscriber(self.callback)
         self.track = track
 
         # To estimate speed
@@ -93,6 +114,6 @@ class TheController(DTROS):
         self.pub.publish(msg)
 
 if __name__ == '__main__':
-    map = get_map_client()
+    map = GetMap().wait_for_map()
     node = TheController(track=map, node_name='controller')
     rospy.spin()

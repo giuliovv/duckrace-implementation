@@ -36,9 +36,6 @@ include_directories(
 )
 
 catkin_install_python(PROGRAMS
-  src/localize.py
-  src/get_map.py
-  src/blind_get_map.py
-  src/blind_controller.py
+  src/controller.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )

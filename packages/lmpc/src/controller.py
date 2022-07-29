@@ -27,19 +27,22 @@ MPC = ca.Function.load(mpc_path)
 delay = round(0.15/0.1)
 u_delay0 = ca.DM(np.zeros((2, delay)))
 
-group = DTCommunicationGroup('my_group', DuckPose)
-group_map = DTCommunicationGroup('map', DuckPose)
+group = DTCommunicationGroup('position', DuckPose)
+group_map = DTCommunicationGroup('map', Floats)
 
+VERBOSE = True
 ROS_SUB = False
+
+MAX_SPEED = 0.1
 
 class GetMap():
 
     def __init__(self):
-        self.map
-        group_map.subscribe(self.map_callback)
+        self.map = None
+        group_map.Subscriber(self.map_callback)
 
-    def map_callback(self, msg):
-        self.map = msg
+    def map_callback(self, msg, header):
+        self.map = msg.data
         print("[Controller]: Got map.")
         rospy.loginfo("[Controller]: Got map.")
 
@@ -51,37 +54,50 @@ class GetMap():
         group_map.shutdown()
         print("[Controller]: Map saved.")
         rospy.loginfo("[Controller]: Map saved.")
-        return self.map
+        return np.array(self.map).reshape(-1,2)
 
 class TheController(DTROS):
 
     def __init__(self, node_name, track):
+        print("[Controller]: Initializing...")
+
         # Duck name
         self.vehicle = os.environ['VEHICLE_NAME']
-        # kdtree
-        self.kdtree = spatial.KDTree(track.T)
-        # initialize the DTROS parent class
-        super(TheController, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
-        # construct publisher
-        self.pub = rospy.Publisher(f"/{self.vehicle}/wheels_driver_node/wheels_cmd", WheelsCmdStamped, queue_size=10)
-        # Subscriber
-        if ROS_SUB:
-            self.subscriber = rospy.Subscriber("/watchtower00/localization",
-                DuckPose, self.callback,  queue_size=1)
-        else:
-            self.subscriber = group.Subscriber(self.callback)
-        self.track = track
 
-        # To estimate speed
+         # To estimate speed
         self.old_x = 0
         self.old_y = 0
         self.old_t = 0
 
-    def callback(self, ros_data):
-        x = ros_data.data.x
-        y = ros_data.data.y
-        t = ros_data.data.t
-        success = ros_data.data.success
+        self.track = track
+
+        # kdtree
+        self.kdtree = spatial.KDTree(track)
+
+        # UDP publisher
+        if not ROS_SUB:
+            self.subscriber = group.Subscriber(self.callback)
+        
+        # initialize the DTROS parent class
+        super(TheController, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
+
+        # Publisher to control the wheels
+        self.pub = rospy.Publisher(f"/{self.vehicle}/wheels_driver_node/wheels_cmd", WheelsCmdStamped, queue_size=1)
+        
+        # Subscriber
+        if ROS_SUB:
+            self.subscriber = rospy.Subscriber("/watchtower00/localization",
+                DuckPose, self.callback,  queue_size=1)
+
+    def callback(self, ros_data, header):
+        x = ros_data.x
+        y = ros_data.y
+        t = ros_data.t
+        success = ros_data.success
+
+        if VERBOSE:
+            print(f"[Controller]: Got data, x: {x}, y: {y}, t: {t}")
+            rospy.loginfo(f"[Controller]: Got data, x: {x}, y: {y}, t: {t}")
 
         if not success:
             return
@@ -97,23 +113,40 @@ class TheController(DTROS):
         self.old_y = y
         self.old_t = t
 
-        x = [x, y, t, v, w]
+        X = [x, y, t, v, w]
 
-        _,idx = self.kdtree.query(np.array([x, y]).reshape(-1), workers=-1)
-        r = self.track[idx, :]
+        _,idx = self.kdtree.query([x, y])
+        distance = 10
+        r = self.track[idx+distance, :]
+        if VERBOSE:
+            print(f"[Controller]: r: {r}")
 
-        print(x)
-        rospy.loginfo("Received position: '%s'" % x)
-
-        u = MPC(x, r, t, u_delay0,  1e3, 5e-4, 1, 1e-3)
+        u = MPC(X, r, t, u_delay0,  1e3, 0, 0, 0)
 
         msg = WheelsCmdStamped()
-        msg.vel_left = u[0]
-        msg.vel_right = u[1]
+        msg.vel_left = u[0]*MAX_SPEED
+        msg.vel_right = u[1]*MAX_SPEED
 
-        self.pub.publish(msg)
+        try:
+            self.pub.publish(msg)
+        except AttributeError:
+            print("[Controller]: Publisher not initialized.")
+
+
+    def on_shutdown(self):
+        print("[Controller]: Shutdown.")
+        rospy.loginfo("[Controller]: Shutdown.")
+        self.pub.publish(WheelsCmdStamped(vel_left=0, vel_right=0))
+        self.subscriber.shutdown()
+        self.pub.unregister()
 
 if __name__ == '__main__':
-    map = GetMap().wait_for_map()
+    take_map = GetMap()
+    try:
+        map = take_map.wait_for_map()
+    except KeyboardInterrupt:
+        print("[Controller]: Keyboard interrupt.")
+        rospy.loginfo("[Controller]: Keyboard interrupt.")
+        exit(0)
     node = TheController(track=map, node_name='controller')
     rospy.spin()

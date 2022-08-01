@@ -2,7 +2,9 @@
 
     <group ns="$(arg veh)">
 
+        <node pkg="lmpc" type="watcher.py" name="watcher" output="screen"/>
         <node pkg="lmpc" type="controller.py" name="lmpc" output="screen"/>
+        <node pkg="lmpc" type="caller.py" name="caller" output="screen"/>
 
     </group>
 

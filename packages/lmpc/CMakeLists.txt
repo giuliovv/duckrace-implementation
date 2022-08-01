@@ -37,5 +37,7 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   src/controller.py
+  src/caller.py
+  src/watcher.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )

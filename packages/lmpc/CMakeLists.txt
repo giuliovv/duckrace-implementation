@@ -39,5 +39,7 @@ catkin_install_python(PROGRAMS
   src/controller.py
   src/caller.py
   src/watcher.py
+  src/getmap.py
+  src/test_model.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )

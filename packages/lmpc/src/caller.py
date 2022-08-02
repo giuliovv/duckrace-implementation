@@ -5,7 +5,7 @@ import rospy
 
 from std_msgs.msg import Bool
 
-MPC_TIME = 1/0.8
+MPC_TIME = 0.1
 
 if __name__ == '__main__':
     rospy.init_node("caller")

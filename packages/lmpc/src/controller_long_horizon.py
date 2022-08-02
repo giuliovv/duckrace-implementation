@@ -26,21 +26,11 @@ VERBOSE = False
 SUB_ROS = False
 RIC_VER = True
 
-# If both the following are False uses open loop until it gets a new poisition from the camera
-# If true does not use the camera but only the model
-OPEN_LOOP = True
-# If True, uses only the camera but not the model
-FORCE_CLOSED_LOOP = False
-assert OPEN_LOOP != FORCE_CLOSED_LOOP
-
 MAX_SPEED = 1
 MPC_TIME = 0.1
 
 lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "LMPC.casadi")
-if RIC_VER:
-    mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_special.casadi")
-else:
-    mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M.casadi")
+mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_long_control_N20.casadi")
 LMPC = ca.Function.load(lmpc_path)
 MPC = ca.Function.load(mpc_path)
 N = 5
@@ -137,9 +127,11 @@ class TheController(DTROS):
         self.old_w = 0
 
         self.last_u = [0,0]
+        self.next_us = np.array([])
 
         self.starting_time = 0
         self.localization_time = 0
+        self.new_position = False
 
         self.track = track
 
@@ -167,8 +159,6 @@ class TheController(DTROS):
         """
         Callback function for the localization subscriber.
         """
-        if self.x and OPEN_LOOP:
-            return
         curr_time = rospy.get_time()
         if VERBOSE:
             print(f"[Controller]: Received message after {curr_time-self.starting_time}s the MPC, and after {curr_time-self.localization_time} the last message.")
@@ -194,6 +184,7 @@ class TheController(DTROS):
         self.old_y = self.y
         self.old_t = self.t
         self.localization_time = curr_time
+        self.new_position = True
         
 
     def control(self, ros_data):
@@ -206,43 +197,62 @@ class TheController(DTROS):
         delta_time = current_time - self.starting_time
         if VERBOSE:
             print(f"[Controller]: Delta time: {delta_time}")
-        
-        # X0
-        self.starting_time = current_time
-        x = self.x
-        y = self.y
-        t = self.t
-        v = self.v
-        w = self.w
 
-        if True:
-            print(f"[Controller]: Use MPC, x: {x}, y: {y}, t: {np.rad2deg(t)}, v: {v}, w: {w}")
-            # rospy.loginfo(f"[Controller]: Got data, x: {x}, y: {y}, t: {np.rad2deg(t)}")
+        if self.next_us.size != 0 and not self.new_position:
+            # If there are still commands to send and there hasn't been any localization message in the last MPC_TIME seconds
+            print("[Controller]: Using MPC...")
+            u = self.next_us[0]
+            self.next_us = self.next_us[1:]
 
-        X = ca.DM([x, y, t, v, w])
-
-        # Reference
-        _,idx = self.kdtree.query([x, y])
-        distance = 10
-        r = self.track[(idx+distance)%N_POINTS_MAP:(idx+distance+N+1)%N_POINTS_MAP, :].T
-        # r = np.array([[ 1.5, 1.5]]*(N+1)).T
-        # r = np.array([[x,y]]*(N+1)).T
-        if True:
-            print(f"[Controller]: r: {r.T}")
-
-        next_r = self.track[(idx+distance+1)%N_POINTS_MAP:(idx+distance+N+2)%N_POINTS_MAP, :]
-        # tr = np.arctan2(r[:,1]-next_r[:,1], r[:,0]-next_r[:,0])
-        tr = ca.DM([[0]*(N+1)])
-
-        #  Control
-        if RIC_VER:
-            # Riccardo version of the MPC
-            weights_0 = [1, 0, 0, 0]
-            u = MPC(X, r, tr, u_delay0,  self.last_u, weights_0)
         else:
-            u = MPC(X, r, tr, u_delay0,  1, 0, 0, 0)
-        print("u: ", u*MAX_SPEED)
 
+            # X0
+            # What if I get a new position while I'm reading the values?
+            if self.new_position:
+                # If I am reading a new position it is very unlickely to overwrite a more recent version
+                self.starting_time = current_time
+                x = self.x
+                y = self.y
+                t = self.t
+                v = self.v
+                w = self.w
+                # If I just used the new position mark it as read
+                self.new_position = False
+            else:
+                # If I am not reading a new position, I do not need to change the value of the flag
+                self.starting_time = current_time
+                x = self.x
+                y = self.y
+                t = self.t
+                v = self.v
+                w = self.w
+
+            if True:
+                print(f"[Controller]: Use MPC, x: {x}, y: {y}, t: {np.rad2deg(t)}, v: {v}, w: {w}")
+                # rospy.loginfo(f"[Controller]: Got data, x: {x}, y: {y}, t: {np.rad2deg(t)}")
+
+            X = ca.DM([x, y, t, v, w])
+
+            # Reference
+            _,idx = self.kdtree.query([x, y])
+            distance = 10
+            r = self.track[(idx+distance)%N_POINTS_MAP:(idx+distance+N+1)%N_POINTS_MAP, :].T
+            # r = np.array([[ 1.5, 1.5]]*(N+1)).T
+            # r = np.array([[x,y]]*(N+1)).T
+            if True:
+                print(f"[Controller]: r: {r.T}")
+
+            next_r = self.track[(idx+distance+1)%N_POINTS_MAP:(idx+distance+N+2)%N_POINTS_MAP, :]
+            # tr = np.arctan2(r[:,1]-next_r[:,1], r[:,0]-next_r[:,0])
+            tr = ca.DM([[0]*(N+1)])
+
+            #  Control
+            self.next_us = MPC(X, r, tr, u_delay0,  1, 0, 0, 0).toarray().T
+
+            u = self.next_us[0]
+            self.next_us = self.next_us[1:]
+
+        print("u: ", u*MAX_SPEED)
         self.last_u = u*MAX_SPEED
 
         # Publish the message
@@ -255,8 +265,8 @@ class TheController(DTROS):
         except AttributeError:
             print("[Controller]: Publisher not initialized.")
 
-        # Update open loop model
-        if not FORCE_CLOSED_LOOP and np.abs(current_time - self.localization_time) > MPC_TIME:
+        # Update open loop model if I havent' already used the new position or if the localization message has been received during the last execution of the MPC
+        if not self.new_position:
             x, y, t, v, w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
             self.x, self.y, self.t, self.v, self.w = x[0], y[0], t[0], v[0], w[0]
 

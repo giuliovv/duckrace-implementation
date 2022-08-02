@@ -2,8 +2,10 @@
 
     <group ns="$(arg veh)">
 
-        <node pkg="lmpc" type="watcher.py" name="watcher" output="screen"/>
+        <!-- <node pkg="lmpc" type="getmap.py" name="mapper" output="screen"/> -->
+        <!-- <node pkg="lmpc" type="watcher.py" name="watcher" output="screen"/> -->
         <node pkg="lmpc" type="controller.py" name="lmpc" output="screen"/>
+        <!-- <node pkg="lmpc" type="test_model.py" name="tester" output="screen"/> -->
         <node pkg="lmpc" type="caller.py" name="caller" output="screen"/>
 
     </group>

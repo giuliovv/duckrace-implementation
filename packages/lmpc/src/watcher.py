@@ -27,7 +27,7 @@ from sensor_msgs.msg import CameraInfo, CompressedImage
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3
 from sensor_msgs.msg import CameraInfo, CompressedImage
-from localization.msg import DuckPose
+from lmpc.msg import DuckPose
 
 # Duckie stuff
 from dt_communication_utils import DTCommunicationGroup

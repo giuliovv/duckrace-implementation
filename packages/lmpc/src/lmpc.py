@@ -3,6 +3,7 @@
 from ast import Return
 from operator import mod
 import os
+from socket import if_nametoindex
 
 import casadi as ca
 import numpy as np
@@ -10,6 +11,7 @@ from scipy import spatial
 from scipy.signal import lfilter
 import pickle
 import matplotlib.pyplot as plt
+from sklearn.neighbors import NearestNeighbors
 
 # ROS
 import rospy, rospkg
@@ -27,7 +29,6 @@ from duckietown.dtros import DTROS, NodeType
 
 VERBOSE = False
 SUB_ROS = False
-RIC_VER = False
 
 # If both the following are False uses open loop until it gets a new poisition from the camera
 # If true does not use the camera but only the model
@@ -440,14 +441,16 @@ map_data = [1.8184616665769566,
 
 MAX_SPEED = 0.5
 MPC_TIME = 0.1
-N = 3
-NEW_PARAM=True
+N_MPC = 3
+N = 2
+# K nearest neighbors
+K = 8
+
+# N iterations to consider
+i_j = 4
 
 lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "LMPC.casadi")
-if RIC_VER:
-    mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_special.casadi")
-else:
-    mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_01_N3_angle_max03_noretro.casadi")
+mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_01_N3_angle_max03_noretro.casadi")
 LMPC = ca.Function.load(lmpc_path)
 MPC = ca.Function.load(mpc_path)
 delay = round(0.15/MPC_TIME)
@@ -456,99 +459,96 @@ u_delay0 = ca.DM(np.zeros((2, delay)))
 group = DTCommunicationGroup('my_position', DuckPose)
 # group_map = DTCommunicationGroup('my_map', Floats)
 
-
 # Default value, will be updated after map retrieval
 N_POINTS_MAP = 200
 
+def model_F(dt=MPC_TIME):
+    """
+    Return the model casadi function tuned according to the parameter found in the thesis.
 
-if not NEW_PARAM:
-    def model_F(dt=0.033):
-        """
-        Return the model casadi function.
+    :param dt: the time step
+    """
+    u1 = 4.3123709
+    u2 = 0.42117578
+    u3 = 0. 
+    w1 = 1.34991163
+    w2 = 0.66724572
+    w3 = 0.74908594
+    u_alpha_r = 2.27306332
+    u_alpha_l = 0.73258966
+    w_alpha_r = 3.12010274
+    w_alpha_l = 2.86162447
+    # States
+    x0 = ca.MX.sym('x')
+    y0 = ca.MX.sym('y')
+    th0 = ca.MX.sym('th')
+    w0 = ca.MX.sym('w')
+    v0 = ca.MX.sym('v')
+    x = ca.vertcat(x0, y0, th0, v0, w0) # Always vertically concatenate the states --> [n_x,1]
+    # Inputs
+    wl = ca.MX.sym('wl')
+    wr = ca.MX.sym('wr')
+    u = ca.vertcat(wl, wr) # Always vertically concatenate the inputs --> [n_u,1]
+    
+    # V =  [[wl], [wr]]
+    V = ca.vertcat(wr, wl)
 
-        :param dt: the time step
-        """
-        up = 5
-        wp = 4
-        # parameters for forced dynamics
-        u_alpha_r = 1.5
-        u_alpha_l = 1.5
-        w_alpha_r = 15  # modify this for trim
-        w_alpha_l = 15
-        
-        # States
-        x0 = ca.MX.sym('x')
-        y0 = ca.MX.sym('y')
-        th0 = ca.MX.sym('th')
-        w0 = ca.MX.sym('w')
-        v0 = ca.MX.sym('v')
-        x = ca.vertcat(x0, y0, th0, v0, w0) # Always vertically concatenate the states --> [n_x,1]
-        # Inputs
-        wl = ca.MX.sym('wl')
-        wr = ca.MX.sym('wr')
-        u = ca.vertcat(wl, wr) # Always vertically concatenate the inputs --> [n_u,1]
-        # System dynamics (CAN BE NONLINEAR! ;))
-        # x_long_dot_dot = -u1*v0 + u_alpha_r*wr + u_alpha_l*wl
-        # w_dot_dot = -w1*w0 + w_alpha_r*wr - w_alpha_l*wl
-        v1 = (1-up*dt)*v0 + u_alpha_r*dt*wr + u_alpha_l*dt*wl
-        w1 = (1-wp*dt)*w0 + w_alpha_r*dt*wr - w_alpha_l*dt*wl
-        x1 = x0 + v0*dt*np.cos(th0 + w0*dt/2)
-        y1 = y0 + v0*dt*np.sin(th0 + w0*dt/2)
-        # Cannot use atan2 because x1 and y1 are approximated while th1 is not
-        theta1 = th0 + w0*dt
-        dae = ca.vertcat(x1, y1, theta1, v1, w1)
-        F = ca.Function('F',[x,u],[dae],['x','u'],['dae'])
-        return F
+    f_dynamic = ca.vertcat(-u1 * v0 - u2 * w0 + u3 * w0 ** 2, -w1 * w0 - w2 * v0 - w3 * v0 * w0)
+    # input Matrix
+    B = ca.DM([[u_alpha_r, u_alpha_l], [w_alpha_r, -w_alpha_l]])
+    # forced response
+    f_forced = B@V
+    # acceleration
+    X_dot_dot = f_dynamic + f_forced
+    
+    v1 = v0 + X_dot_dot[0] * dt
+    w1 = w0 + X_dot_dot[1] * dt
+    x1 = x0 + v0*dt*np.cos(th0 + w0*dt/2)
+    y1 = y0 + v0*dt*np.sin(th0 + w0*dt/2)
+    # Cannot use atan2 because x1 and y1 are approximated while th1 is not
+    theta1 = th0 + w0*dt
+    dae = ca.vertcat(x1, y1, theta1, v1, w1)
+    F = ca.Function('F',[x,u],[dae],['x','u'],['dae'])
+    return F
 
-if NEW_PARAM:
-    def model_F(dt=0.033):
-        """
-        Return the model casadi function tuned according to the parameter found by estimation.
+def get_border(traj, distance=0.15):
+    """
+    Get the border of the trajectory.
+    
+    :param traj: the trajectory of the yellow line
+    :param distance: the distance from the center
 
-        :param dt: the time step
-        """
-        u1 = 4.3123709
-        u2 = 0.42117578
-        u3 = 0. 
-        w1 = 1.34991163
-        w2 = 0.66724572
-        w3 = 0.74908594
-        u_alpha_r = 2.27306332
-        u_alpha_l = 0.73258966
-        w_alpha_r = 3.12010274
-        w_alpha_l = 2.86162447
-        # States
-        x0 = ca.MX.sym('x')
-        y0 = ca.MX.sym('y')
-        th0 = ca.MX.sym('th')
-        w0 = ca.MX.sym('w')
-        v0 = ca.MX.sym('v')
-        x = ca.vertcat(x0, y0, th0, v0, w0) # Always vertically concatenate the states --> [n_x,1]
-        # Inputs
-        wl = ca.MX.sym('wl')
-        wr = ca.MX.sym('wr')
-        u = ca.vertcat(wl, wr) # Always vertically concatenate the inputs --> [n_u,1]
-        
-        # V =  [[wl], [wr]]
-        V = ca.vertcat(wr, wl)
+    :return: the borders of the track
+    """
+    borders_inside = []
+    borders_outside = []
+    xm, ym = traj.mean(0)
+    for idx, _ in enumerate(traj[:-1]):
+        x0, y0 = traj[idx]
+        x1, y1 = traj[idx+1]
+        m = (y1 - y0) / (x1 - x0)
+        xp, yp = (x1 + x0) / 2, (y1 + y0) / 2
+        mp = -1 / m
+        kp = yp - mp * xp
+        a = 1+mp**2
+        b = -2*xp+2*mp*(kp-yp)
+        c = -distance**2+(kp-yp)**2+xp**2
+        try:
+            xs0, xs1 = np.roots([a,b,c])
+        except np.linalg.LinAlgError:
+            print("No solution")
+            continue
+        ys0, ys1 = mp*xs0+kp, mp*xs1+kp
 
-        f_dynamic = ca.vertcat(-u1 * v0 - u2 * w0 + u3 * w0 ** 2, -w1 * w0 - w2 * v0 - w3 * v0 * w0)
-        # input Matrix
-        B = ca.DM([[u_alpha_r, u_alpha_l], [w_alpha_r, -w_alpha_l]])
-        # forced response
-        f_forced = B@V
-        # acceleration
-        X_dot_dot = f_dynamic + f_forced
-        
-        v1 = v0 + X_dot_dot[0] * dt
-        w1 = w0 + X_dot_dot[1] * dt
-        x1 = x0 + v0*dt*np.cos(th0 + w0*dt/2)
-        y1 = y0 + v0*dt*np.sin(th0 + w0*dt/2)
-        # Cannot use atan2 because x1 and y1 are approximated while th1 is not
-        theta1 = th0 + w0*dt
-        dae = ca.vertcat(x1, y1, theta1, v1, w1)
-        F = ca.Function('F',[x,u],[dae],['x','u'],['dae'])
-        return F
+        if (xs0-xm)**2+(ys0-ym)**2 < (xs1-xm)**2+(ys1-ym)**2:
+            borders_inside.append([xs0, ys0])
+            borders_outside.append([xs1, ys1])
+        else:
+            borders_inside.append([xs1, ys1])
+            borders_outside.append([xs0, ys0])
+    borders_inside = np.array(borders_inside)
+    borders_outside = np.array(borders_outside)
+    return borders_inside, borders_outside
 
 class GetMap():
 
@@ -563,6 +563,9 @@ class GetMap():
         rospy.loginfo("[Controller]: Got map.")
 
     def wait_for_map(self):
+        """
+        Wait until a message with the map description is received.
+        """
         print("[Controller]: Getting map...")
         rospy.loginfo("[Controller]: Getting map...")
         if not map_data:
@@ -575,19 +578,22 @@ class GetMap():
         map = np.around(map, 2)
         # Cut map to number of points of interest:
         map = map[::10] # 5 appears to be the best number of points
+        # Compute angles wrt to the next point
         angles = np.zeros(map.shape[0])
         angles[:-1] = np.arctan2(map[1:,1]-map[:-1,1], map[1:,0]-map[:-1,0])
         angles[-1] = np.arctan2(map[0,1]-map[-1,1], map[0,0]-map[-1,0])
         # angles[angles < 0] += 2*np.pi
         angles = np.around(angles, 1)
         self.map = np.hstack((map, angles.reshape(-1,1)))
+        # Compute track borders
+        inside, outside = get_border(self.map, distance=0.16)
         print("[Controller]: Map saved.")
         rospy.loginfo("[Controller]: Map saved.")
-        return self.map
+        return self.map, inside, outside
 
 class TheController(DTROS):
 
-    def __init__(self, node_name, track):
+    def __init__(self, node_name, track, inside, outside):
         print("[Controller]: Initializing...")
 
         # Duck name
@@ -596,6 +602,13 @@ class TheController(DTROS):
         # initialize the DTROS parent class
         super(TheController, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
 
+        # Track description
+        self.track = track
+        self.inside = inside
+        self.outside = outside
+        self.positions = []
+
+        # Car model
         self.F = model_F(dt=MPC_TIME)
 
         # Position
@@ -605,35 +618,48 @@ class TheController(DTROS):
         self.v = 0
         self.w = 0
 
-        # To estimate speed
-        self.old_x = 0
-        self.old_y = 0
-        self.old_t = 0
-        self.old_v = 0
-        self.old_w = 0
+        self.last_u = [0,0]
 
+        # LMPC initialization
+        self.finish_line = None
+        self.loop_n = 0
+        self.iteration_n = 0
+        self.Js = []
+        self.plain_loops = []
+        self.loops_with_time = []
+        self.kdins = spatial.KDTree(inside)
+        self.ins_len = inside.shape[0]
+        self.already_changed = False
+
+        self.X_log = np.empty((5,0))
+        self.U_log = np.empty((2,0))
+        self.X_log_origin = None
+        self.all_points = None
+        self.first_loop_len = None
+        self.last_loop = None
+        # Distance to point for convex hull inside borders
+        self.more = 20
+
+        # Moving average filter
         self.n_samples_m_average = 3
         self.last_5_samples = np.zeros((self.n_samples_m_average, 3))
         self.last_5_samples_index = 0
         self.wait_to_start_idx = 0
 
-        self.last_u = [0,0]
-
+        # Timing
         self.starting_time = 0
         self.localization_time = 0
-
-        self.track = track
-        self.positions = []
 
         # kdtree
         self.kdtree = spatial.KDTree(track[:,:2])
 
+        # Subscribers
         if SUB_ROS:
             # If subscribe to topic published by duckiebot
-            self.subscriber = rospy.Subscriber("~/localization", DuckPose, self.callback)
+            self.subscriber = rospy.Subscriber("~/localization", DuckPose, self._cb_localization)
         else:
             # UDP subscriber, if we use data from watchtower
-            self.subscriber = group.Subscriber(lambda ros_data, header : self.callback(ros_data))
+            self.subscriber = group.Subscriber(lambda ros_data, header : self._cb_localization(ros_data))
         
 
         # Publishers
@@ -643,10 +669,10 @@ class TheController(DTROS):
         self.pub_e_stop = rospy.Publisher(f"/{self.vehicle}/wheels_driver_node/emergency_stop",BoolStamped,queue_size=1)
         
         # Save the message from the watchtower every time it arrives but run the MPC every MPC_TIME seconds
-        rospy.Subscriber("/execute_controller", Bool, self.control, queue_size=1)
+        rospy.Subscriber("/execute_controller", Bool, self._control, queue_size=1)
 
 
-    def callback(self, ros_data):
+    def _cb_localization(self, ros_data):
         """
         Callback function for the localization subscriber.
         """
@@ -667,22 +693,22 @@ class TheController(DTROS):
             self.x = ros_data.x
             self.y = ros_data.y
             self.t = ros_data.t
-            # self.v = np.sqrt((ros_data.x-self.old_x)**2+(ros_data.y-self.old_y)**2)/(curr_time-self.localization_time)
-            # self.v = MAX_SPEED*0.6*(self.last_u[0] + self.last_u[1])/2
-            # self.w = MAX_SPEED*np.around(0.6*(self.last_u[1] - self.last_u[0])/0.1, 4)
             print("\n[Controller]: Pose: ", ros_data.x, ros_data.y, np.rad2deg(ros_data.t))
         else:
             print("[Controller]: Position failed, using odometry...")
             x, y, t, v, w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
             self.x, self.y, self.t, self.v, self.w = x[0], y[0], t[0], v[0], w[0]
 
-        self.old_x = self.x
-        self.old_y = self.y
-        self.old_t = self.t
+        # self.old_x = self.x
+        # self.old_y = self.y
+        # self.old_t = self.t
         self.localization_time = curr_time
+
+        if self.finish_line == None:
+            self.finish_line = [self.x, self.y, self.t]
         
 
-    def control(self, ros_data):
+    def _control(self, ros_data):
         """
         Control function, callback for the /execute_controller topic.
         """
@@ -693,36 +719,127 @@ class TheController(DTROS):
         if VERBOSE:
             print(f"[Controller]: Delta time: {delta_time}")
         
-        # X0
+        # Retrieve X0
         self.starting_time = current_time
         x = np.around(self.x, 2)
         y = np.around(self.y, 2)
         t = np.around(self.t, 1)
         v = self.v
         w = self.w
-
-        # v = MAX_SPEED*0.6*(self.last_u[0] + self.last_u[1])/2
-
-        # self.last_5_samples[self.last_5_samples_index] = [self.x, self.y, self.t]
-        # self.last_5_samples_index = (self.last_5_samples_index + 1) % self.n_samples_m_average
-        # self.x, self.y, self.t = self.last_5_samples.mean(axis=0)
-        # self.wait_to_start_idx += 1
-
-        # if self.wait_to_start_idx < self.n_samples_m_average:
-        #     return
-
         self.positions.append([x, y, t, v, w])
-
-        if True:
+        if VERBOSE:
             print(f"\n[Controller]: Use MPC, x: {x}, y: {y}, t: {np.rad2deg(t)}, v: {v}, w: {w}")
-            # rospy.loginfo(f"[Controller]: Got data, x: {x}, y: {y}, t: {np.rad2deg(t)}")
 
+        # Complete state
         X = ca.DM([x, y, t, v, w])
 
-        # Reference
+        # Compute reference
+        # TODO it may be needed to check if idx is always >= old idx
         _,idx = self.kdtree.query([x, y], k=2)
         idx = max(idx) if (min(idx) != 0 or max(idx) == 1) else 0
-        idx = (idx+4) % N_POINTS_MAP
+
+        # Check if finish line
+        if self.track[idx, 1] <= self.finish_line[1] and self.iteration_n >= 200:
+            self.loop_n += 1
+            self.iteration_n = 0
+            print("[LMPC]: Loop n ", self.loop_n)
+
+            # If loop 0 has just ended we need to initialize the LMPC
+            if self.loop_n == 1:
+                # New state definition to consider the time to arrive,
+                # all_points: [x, y, theta, v, w, steps to arrive]
+                self.all_points = self.X_log
+                self.first_loop_len = self.all_points.shape[1]
+                self.all_points = np.vstack((self.all_points, np.arange(self.first_loop_len)[::-1]))
+                self.last_iterations = np.hstack([self.all_points]*i_j)
+                if idx+N > self.all_points.shape[1]:
+                    idx = self.all_points.shape[1] - idx
+
+                # Save first loop
+                self.X_log_origin = self.X_log
+
+            # At start of each LMPC loop reset the values
+            if self.loop_n >= 1:
+                # Compute last iteration distance to last point
+                self.last_loop = self.X_log
+                last_points = self.X_log
+                last_points = np.vstack((last_points, np.arange(last_points.shape[1])[::-1]))
+                self.loops_with_time.append(last_points)
+
+                # Reset as new loop is starting
+                self.X_log = np.empty((5,0))
+                self.U_log = np.empty((2,0))
+                
+                # Angle normalization
+                X[2] = ca.mod(X[2]+ca.pi, 2*ca.pi)-ca.pi
+
+                # Reset search tree to last loop
+                self.kdtree = spatial.KDTree(self.last_loop[:2, :(1/MPC_TIME)*10].T)
+
+                # Hide the last points of the track to avoid misdirections 
+                self.last_iterations_filtered = self.last_iterations[np.vstack([self.last_iterations[-1] > K]*6)].reshape(6,-1)
+
+                # Nearest neighbour for LMPC
+                self.nbrs = NearestNeighbors(n_neighbors=K*i_j, algorithm='ball_tree').fit(self.last_iterations_filtered[:2].T)
+
+                # Flag to update old states ad prevent misdirections 
+                self.already_changed = False
+            
+            print("[LMPC]: Last time: ", [t.shape[1]*MPC_TIME for t in self.loops_with_time])
+        # If it is far enough and using LMPC
+        elif self.iteration_n == K+N and self.loop_n >= 1:
+            # Stop hiding points in nbrs
+            self.kdtree = spatial.KDTree(self.last_loop[:2, :].T)
+            self.last_iterations_filtered = self.last_iterations
+            self.nbrs = NearestNeighbors(n_neighbors=K*i_j, algorithm='ball_tree').fit(self.last_iterations[:2, :].T)
+
+        # If the car is about to complete the lap
+        # TODO update with autolab values
+        if x[1] > 1 and x[1] < 1.7 and x[0] > 1.5 and not self.already_changed:
+            # The first points in the next iteration have time 0
+            self.last_iterations_filtered[-1, :N+K*i_j] = 0
+
+            # The first points in the next iteration are as in the first loop
+            self.last_iterations_filtered[:-1, :N+1] = self.X_log_orig[:, :N+1]
+
+            # After one iteration the angle is +2*pi 
+            self.last_iterations_filtered[2, :N+K*i_j] += 2*np.pi
+
+            # Do not update this values again during the current lap
+            self.already_changed = True
+
+        # Select MPC vs LMPC
+        if self.loop_n == 0:
+            self._mpc(X, idx, current_time)
+        else:
+            self._lmpc(X, idx)
+
+        # Update open loop model
+        # If there has not been a new message during the execution
+        # of the control loop update the position open loop.
+        # If there will be a message before the next execution of the
+        # control loop this value will be overwritten
+        if (not FORCE_CLOSED_LOOP and np.abs(current_time - self.localization_time) > MPC_TIME) or OPEN_LOOP:
+            try:
+                x, y, t, v, w = self.F(ca.DM([self.x, self.y, self.t, self.v, self.w]), u).toarray()
+            except Exception:
+                print(x, y, t, v, w, self.last_u)
+                raise
+            self.x, self.y, self.t, self.v, self.w = x[0], y[0], t[0], v[0], w[0]
+
+        # Keep track of iteration number (=time/MPC_TIME)
+        self.iteration_n += 1
+
+    def _mpc(self, X, idx, current_time):
+        """
+        MPC function.
+
+        :param X: Current state.
+        :param idx: Index of the closest point in the track.
+        :param current_time: Current time.
+        """
+
+        # Reference
         if idx+N+1 < N_POINTS_MAP:
             r = self.track[idx:idx+N+1, :].T
         else:
@@ -730,26 +847,17 @@ class TheController(DTROS):
             r = np.vstack((r, self.track[:idx+N+1-N_POINTS_MAP, :]))
             r = r.T
         
-        # r = np.repeat(r[:,0].reshape(1, -1), N+1, axis=0).T
-        # r = np.array([[ 1.5, 1.5, 0]]*(N+1)).T
-        # r = np.array([[x,y]]*(N+1)).T
-        # r = np.repeat(self.track[(idx+1)%N_POINTS_MAP, :], N+1, axis=0).T
-        if True:
-            print(f"[Controller]: r: {r.T}")
+        if VERBOSE:
+            print(f"[LMPC]: r: {r.T}")
 
+        # Angular reference
         tr = r[2,:]
         r = r[:2, :]
 
         #  Control
-        if RIC_VER:
-            # Riccardo version of the MPC
-            weights_0 = [1, 0, 0, 0]
-            u = MPC(X, r, tr, u_delay0,  self.last_u, weights_0)*MAX_SPEED
-        else:
-            u = MPC(X, r, tr, u_delay0,  1, 0, 0, 0)*MAX_SPEED
+        u = MPC(X, r, tr, u_delay0,  1, 0, 0, 0)*MAX_SPEED
         u = np.around([u[0], u[1]], 3)
-        print("[Controller]: u: ", u)
-
+        print("[LMPC]: u: ", u)
         self.last_u = u
 
         # Publish the message
@@ -763,14 +871,54 @@ class TheController(DTROS):
             print("[Controller]: Publisher not initialized.")
             return
 
-        # Update open loop model
-        if (not FORCE_CLOSED_LOOP and np.abs(current_time - self.localization_time) > MPC_TIME) or OPEN_LOOP:
-            try:
-                x, y, t, v, w = self.F(ca.DM([self.x, self.y, self.t, self.v, self.w]), u).toarray()
-            except Exception:
-                print(x, y, t, v, w, self.last_u)
-                raise
-            self.x, self.y, self.t, self.v, self.w = x[0], y[0], t[0], v[0], w[0]
+        self.X_log = np.column_stack((self.X_log, X))
+        self.U_log = np.column_stack((self.U_log, u))
+
+
+    def _lmpc(self, X, idx):
+        """
+        LMPC function.
+        
+        :param X: Current state.
+        :param idx: Index of the closest point in the track.
+        """
+        distances, indices = self.nbrs.kneighbors([self.last_loop[:2, (idx+N)%self.last_loop.shape[1]].T])
+        indices = indices.reshape(-1)
+
+        # Compute values for convex hull
+        if self.iteration_n == 0:
+            D = self.last_iterations_filtered[:-1, indices]
+            J = self.last_iterations_filtered[-1, indices].reshape(-1)
+        else:
+            S = self.last_iterations_filtered[:, indices]@l
+            distances, indices = self.nbrs.kneighbors(np.array(S[:2].T))
+            indices = indices.reshape(-1)
+            D = self.last_iterations_filtered[:-1, indices]
+            J = self.last_iterations_filtered[-1, indices].reshape(-1)
+        
+        self.Js.append(J)
+
+        # Closest point to the current pose in inside line
+        _, border_idx = self.kdins.query(np.array([X[0], X[1]]).reshape(-1), workers=-1)
+        # Margins in track for convex hull
+        margins = np.array([
+            inside[border_idx],
+            inside[(border_idx+N+self.more)%self.ins_len],
+            outside[border_idx],
+            outside[(border_idx+N+int(self.more/4))%self.ins_len],
+            outside[(border_idx+N+self.more)%self.ins_len]]).T
+
+        # Call the LMPC function
+        u, l = LMPC(X, ca.DM(D[:, :]), ca.DM(J)/600, (np.arange(self.iteration_n, self.iteration_n+N-1)>=self.finish_line.t).T, margins)
+
+        # Approximate the input
+        u = np.around([u[0], u[1]], 3)
+        print("[LMPC]: u: ", u)
+        self.last_u = u
+
+        # Store last values
+        U_log = np.column_stack((U_log, u))
+        X_log = np.column_stack((X_log, X))
 
 
     def on_shutdown(self):
@@ -789,10 +937,10 @@ class TheController(DTROS):
 
 if __name__ == '__main__':
     take_map = GetMap()
-    map = take_map.wait_for_map()
+    track, inside, outside = take_map.wait_for_map()
     N_POINTS_MAP = map.shape[0]
     print(f"[Controller]: Map has {N_POINTS_MAP} points.")
-    node = TheController(track=map, node_name='controller')
+    node = TheController(track=track, inside=inside, outside=outside, node_name='controller')
     try:
         rospy.spin()
     except KeyboardInterrupt:

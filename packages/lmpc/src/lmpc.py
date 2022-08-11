@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 
-from ast import Return
-from operator import mod
 import os
-from socket import if_nametoindex
 
 import casadi as ca
 import numpy as np
 from scipy import spatial
-from scipy.signal import lfilter
 import pickle
 import matplotlib.pyplot as plt
 from sklearn.neighbors import NearestNeighbors
@@ -35,7 +31,7 @@ SUB_ROS = False
 OPEN_LOOP = False
 # If True, uses only the camera but not the model
 FORCE_CLOSED_LOOP = False
-if FORCE_CLOSED_LOOP == OPEN_LOOP == True:
+if FORCE_CLOSED_LOOP and OPEN_LOOP:
     print("[Controller]: Warning both FORCE_CLOSED_LOOP and OPEN_LOOP are True")
 
 map_data = [1.8184616665769566,

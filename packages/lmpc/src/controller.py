@@ -257,7 +257,7 @@ class TheController(DTROS):
         # Position
         self.x = None
         self.y = None
-        self.t = None
+        self.t = -np.pi/2
         self.v = 0
         self.w = 0
 
@@ -312,20 +312,24 @@ class TheController(DTROS):
             return
         curr_time = rospy.get_time()
         if VERBOSE:
-            print(f"[Controller]: Received message after {curr_time-self.starting_time}s the MPC, and after {curr_time-self.localization_time} the last message.")
+            print(f"[Controller]: Received message after {curr_time-self.starting_time}s the MPC, and after {curr_time-self.localization_time} the last message.\n")
         if self.x:
             try:
-                _, _, _, v, w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
+                _, _, t, v, w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
                 self.v = np.around(v[0], 3)
                 self.w = np.around(w[0], 3)
+                self.t = (t[0]+np.pi)%(2*np.pi)-np.pi
             except Exception:
                 print("[Controller]: Error in F.", self.x, self.y, self.t, self.v, self.w, self.last_u)
-            # self.w = w[0]
         if ros_data.success:
             self.x = ros_data.x
             self.y = ros_data.y
-            self.t = ros_data.t
-            print("\n[Controller]: Pose: ", ros_data.x, ros_data.y, np.rad2deg(ros_data.t))
+            # self.t = ros_data.t
+            if ros_data.t * self.t < 0: # a positive and a negative angle
+                self.t = ros_data.t if min(ros_data.t, self.t) + np.pi/2 < max(ros_data.t, self.t) else self.t
+            else: # same sign
+                self.t = ros_data.t if np.abs(ros_data.t-self.t) < np.pi/2 else self.t
+            print("\n[Controller]: Pose: ", ros_data.x, ros_data.y, np.rad2deg(ros_data.t), "\n")
         else:
             print("[Controller]: Position failed...")
 
@@ -367,7 +371,7 @@ class TheController(DTROS):
         self.positions.append([x, y, t, v, w])
 
         if True:
-            print(f"\n[Controller]: Use MPC, x: {x}, y: {y}, t: {np.rad2deg(t)}, v: {v}, w: {w}")
+            print(f"\n[Controller]: Use MPC, x: {x}, y: {y}, t: {np.rad2deg(t)}, v: {v}, w: {w}\n")
             # rospy.loginfo(f"[Controller]: Got data, x: {x}, y: {y}, t: {np.rad2deg(t)}")
 
         X = ca.DM([x, y, t, v, w])
@@ -383,7 +387,7 @@ class TheController(DTROS):
         #     self.iteration += 1
         _,idx = self.kdtree.query([x, y], k=2)
         idx = max(idx) if (min(idx) != 0 or max(idx) == 1) else 0
-        idx = (idx+1) % N_POINTS_MAP
+        idx = (idx+1) % N_POINTS_MAP # 1 is best
         if idx+N+1 < N_POINTS_MAP:
             r = self.track[idx:idx+N+1, :].T
         else:
@@ -396,7 +400,7 @@ class TheController(DTROS):
         # r = np.array([[ 0.3, 2.5, 0]]*(N+1)).T
         # r = np.array([[x,y]]*(N+1)).T
         # r = np.repeat(self.track[(idx+1)%N_POINTS_MAP, :], N+1, axis=0).T
-        if True:
+        if VERBOSE:
             print(f"[Controller]: r: {r.T}")
 
         tr = r[2,:]
@@ -410,7 +414,7 @@ class TheController(DTROS):
         else:
             u = MPC(X, r, tr, u_delay0, 1e3, 1e-2, 0, 10)*MAX_SPEED
         u = np.around([u[0], u[1]], 3)
-        print("[Controller]: u: ", u)
+        print("[Controller]: u: ", u, "\n")
 
         self.last_u = u
 

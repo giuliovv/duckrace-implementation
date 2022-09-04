@@ -214,7 +214,7 @@ class TheController(DTROS):
 
         self.control_N += 1
 
-        u = [0.6*MAX_SPEED, 1.*MAX_SPEED]
+        u = [0.6*MAX_SPEED, 1*MAX_SPEED]
 
         model_x, model_y, model_t, model_v, model_w = self.F([self.model_x, self.model_y, self.model_t, self.model_v, self.model_w], u).toarray()
         self.model_x, self.model_y, self.model_t, self.model_v, self.model_w = model_x[0], model_y[0], model_t[0], model_v[0], model_w[0]

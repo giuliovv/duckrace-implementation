@@ -45,12 +45,10 @@ MPC_TIME = 0.1
 N = 10
 NEW_PARAM=True
 
-lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "LMPC.casadi")
 if RIC_VER:
     mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "M_ric_N10_manual_200p_speed05.casadi")
 else:
     mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "N10_max03_fittedspeed.casadi")
-LMPC = ca.Function.load(lmpc_path)
 MPC = ca.Function.load(mpc_path)
 delay = round(0.15/MPC_TIME)
 u_delay0 = ca.DM(np.zeros((2, delay)))
@@ -280,6 +278,7 @@ class TheController(DTROS):
 
         self.track = track
         self.positions = []
+        self.inputs = []
 
         self.iteration = 0
 
@@ -417,6 +416,7 @@ class TheController(DTROS):
         print("[Controller]: u: ", u, "\n")
 
         self.last_u = u
+        self.inputs.append(u.tolist())
 
         # Publish the message
         msg = WheelsCmdStamped()
@@ -445,13 +445,8 @@ class TheController(DTROS):
         self.pub.publish(WheelsCmdStamped(vel_left=0, vel_right=0))
         self.subscriber.shutdown()
         self.pub.unregister()
-        plt.plot(*self.track.T)
-        plt.scatter(*np.array(self.positions)[:, :2].T)
-        plt.show()
-        plt.savefig("map.png")
-        print(self.positions)
-        with open('filename.pickle', 'wb') as handle:
-            pickle.dump(self.positions, handle)
+        print("Positions: ", self.positions)
+        print("Inputs: ", self.inputs)
 
 if __name__ == '__main__':
     take_map = GetMap()

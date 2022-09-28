@@ -1,7 +1,7 @@
 # Duckrace Implementation
 
 Folder containing the implementation of the duckrace algorithm in the real track.
-To use install the duckietown shell DTS and run the following command to build:
+To use install the <a href="https://github.com/duckietown/duckietown-shell">duckietown shell DTS</a> and run the following command to build:
 ```
 dts devel build -f
 ```

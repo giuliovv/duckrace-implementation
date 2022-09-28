@@ -12,7 +12,7 @@ dts devel run
 Based on ROS, find the scripts inside packages/lmpc.
 
 In the latest version the nodes are meant to be run on a pc connectected to the same network as the duckiebots.
-If you want to run the code in the duckiebots use the flag -H in both build and run followed by the robot name (duckwalker.local or duckvader.local, duckvader is preferred).
+If you want to run the code in the duckiebots use the flag -H in both build and run followed by the robot name (duckwalker.local or duckvader.local, duckvader is preferred) and remove ROS_MASTER_URI from launchers/default.sh (a script that runs when the container is launched).
 
 ## Packages:
 

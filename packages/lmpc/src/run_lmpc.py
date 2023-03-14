@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 from timeit import default_timer as timer
 
 import casadi as ca
@@ -19,10 +20,13 @@ from std_msgs.msg import Bool
 from lmpc.msg import DuckPose
 from lmpc.msg import Floats
 from duckietown_msgs.msg import WheelsCmdStamped, BoolStamped
+from sensor_msgs.msg import Imu
 
 # Duckie
 from dt_communication_utils import DTCommunicationGroup
 from duckietown.dtros import DTROS, NodeType
+
+np.set_printoptions(threshold=sys.maxsize)
 
 VERBOSE = False
 SUB_ROS = False
@@ -35,7 +39,7 @@ FORCE_CLOSED_LOOP = False
 if FORCE_CLOSED_LOOP and OPEN_LOOP:
     print("[LMPC]: Warning both FORCE_CLOSED_LOOP and OPEN_LOOP are True")
 
-map_path = os.path.join(rp.get_path("lmpc"), "src", "maps", "map_400_points.npy")
+map_path = os.path.join(rp.get_path("lmpc"), "src", "maps", "map_400_fixed.npy")
 with open(map_path, 'rb') as f:
     map_data = np.load(f)
 
@@ -44,13 +48,13 @@ MPC_TIME = 0.1
 N_MPC = 10
 N = 3
 # K nearest neighbors
-K = 1
+K = 3
 
 # N iterations to consider
 i_j = 2
 
-lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", f"LMPC_max03_noborder_k{K}_ij{i_j}_N{N}.casadi")
-mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "N10_max03_fittedspeed.casadi")
+lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", f"LMPC_max03_noborder_noorientation_k{K}_ij{i_j}_N{N}.casadi")
+mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "N10_max03_fittedspeed.casadi") #N10_max03_fittedspeed.casadi
 LMPC = ca.Function.load(lmpc_path)
 MPC = ca.Function.load(mpc_path)
 delay = round(0.15/MPC_TIME)
@@ -68,16 +72,42 @@ def model_F(dt=MPC_TIME):
 
     :param dt: the time step
     """
-    u1 = 4.3123709
-    u2 = 0.42117578
-    u3 = 0. 
-    w1 = 1.34991163
-    w2 = 0.66724572
-    w3 = 0.74908594
-    u_alpha_r = 2.27306332
-    u_alpha_l = 0.73258966
-    w_alpha_r = 3.12010274
-    w_alpha_l = 2.86162447
+    # u1 = 4.3123709
+    # u2 = 0.42117578
+    # u3 = 0. 
+    # w1 = 1.34991163
+    # w2 = 0.66724572
+    # w3 = 0.74908594
+    # u_alpha_r = 2.27306332
+    # u_alpha_l = 0.73258966
+    # w_alpha_r = 3.12010274
+    # w_alpha_l = 2.86162447
+
+    # FITTED wrt speed
+    # [2.14148837,  0.12200042, -0.28237442,  1.3380637 ,  0.40072379, 1.30781483,  1.03762896,  0.62189597,  2.9650673 ,  2.89169198] 
+    u1 = 2.14148837
+    u2 = 0.12200042
+    u3 = -0.28237442
+    w1 = 1.3380637
+    w2 = 0.40072379
+    w3 = 1.30781483
+    u_alpha_r = 1.30781483
+    u_alpha_l = 1.03762896
+    w_alpha_r = 2.9650673
+    w_alpha_l = 2.89169198
+
+    # Normalized
+    # u1 = 3.51843
+    # u2 = -0.40282789
+    # u3 = 0.2789241
+    # w1 = 1.41903836
+    # w2 = 0.16628764
+    # w3 = 1.52162695
+    # u_alpha_r = 0.54710851
+    # u_alpha_l = -0.50963813
+    # w_alpha_r = 1.08095586
+    # w_alpha_l = 0.73014709
+
     # States
     x0 = ca.MX.sym('x')
     y0 = ca.MX.sym('y')
@@ -105,6 +135,11 @@ def model_F(dt=MPC_TIME):
     w1 = w0 + X_dot_dot[1] * dt
     x1 = x0 + v0*dt*np.cos(th0 + w0*dt/2)
     y1 = y0 + v0*dt*np.sin(th0 + w0*dt/2)
+
+    # x1 = (x0-0.24)/1.68 + v0*dt*np.cos(th0 + w0*dt/2)
+    # y1 = (y0-0.34)/3.18 + v0*dt*np.sin(th0 + w0*dt/2)
+    # x1 = x1*1.68+0.24
+    # y1 = y1*3.18+0.34
     # Cannot use atan2 because x1 and y1 are approximated while th1 is not
     theta1 = th0 + w0*dt
     dae = ca.vertcat(x1, y1, theta1, v1, w1)
@@ -140,6 +175,26 @@ class GetMap():
         print("[LMPC]: Got map.")
         rospy.loginfo("[LMPC]: Got map.")
 
+
+    def _centered_moving_average(self, a, n=3):
+        border = n//2
+        for idx in range(border, len(a)-border):
+            a[idx] = (a[idx-border]+a[idx+border])/2
+        return a
+
+    def _clean_angle_reference(self, ref_angle, n=4):
+        """
+        Dirty solution to clean the angle references
+        Remove outliers and do central moving average
+        """
+        for idx in range(0, 50):
+            if ref_angle[idx] < 0:
+                ref_angle[idx] = np.pi
+        for idx in range(60, 100):
+            if ref_angle[idx] > 0:
+                ref_angle[idx] = -np.pi
+        return np.hstack([self._centered_moving_average(ref_angle[:50], 4), ref_angle[50:60], self._centered_moving_average(ref_angle[60:], 4)])
+
     def wait_for_map(self):
         """
         Wait until a message with the map description is received.
@@ -160,6 +215,7 @@ class GetMap():
         angles = np.zeros(map.shape[0])
         angles[:-1] = np.arctan2(map[1:,1]-map[:-1,1], map[1:,0]-map[:-1,0])
         angles[-1] = np.arctan2(map[0,1]-map[-1,1], map[0,0]-map[-1,0])
+        angles = self._clean_angle_reference(angles)
         # angles[angles < 0] += 2*np.pi
         angles = np.around(angles, 1)
         self.map = np.hstack((map, angles.reshape(-1,1)))
@@ -187,6 +243,7 @@ class TheController(DTROS):
         self.positions = []
         self.lmpc_references = []
         self.lmpc_references_points = []
+        self.mpc_reference = []
 
         # Car model
         self.F = model_F(dt=MPC_TIME)
@@ -197,6 +254,11 @@ class TheController(DTROS):
         self.t = -np.pi/2
         self.v = 0
         self.w = 0
+
+        self.imu_time = rospy.get_time()
+
+        self.ideal_states = []
+        self.camera_states = []
 
         self.last_u = [0,0]
 
@@ -224,10 +286,11 @@ class TheController(DTROS):
         self.more = 20
 
         # Moving average filter
-        self.n_samples_m_average = 3
-        self.last_5_samples = np.zeros((self.n_samples_m_average, 3))
-        self.last_5_samples_index = 0
+        self.n_samples_m_average = 1
+        self.last_n_samples = np.ones((self.n_samples_m_average, 1)) * (-np.pi/2)
+        self.last_n_samples_index = 0
         self.wait_to_start_idx = 0
+        self.old_t = -np.pi/2
 
         # Timing
         self.starting_time = 0
@@ -243,6 +306,8 @@ class TheController(DTROS):
         else:
             # UDP subscriber, if we use data from watchtower
             self.subscriber = group.Subscriber(lambda ros_data, header : self._cb_localization(ros_data))
+
+        self.imu_subscriber = rospy.Subscriber("~/imu_node/imu_data", Imu, self._cb_imu)
         
 
         # Publishers
@@ -266,29 +331,55 @@ class TheController(DTROS):
             print(f"[Controller]: Received message after {curr_time-self.starting_time}s the MPC, and after {curr_time-self.localization_time} the last message.")
         if self.x:
             try:
-                _, _, t, v, w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
-                self.v = np.around(v[0], 3)
-                self.w = np.around(w[0], 3)
+                _x, _y, t, _v, _w = self.F([self.x, self.y, self.t, self.v, self.w], self.last_u).toarray()
+                # self.v = np.around(v[0], 3)
+                # self.w = np.around(w[0], 3)
                 self.t = (t[0]+np.pi)%(2*np.pi)-np.pi
+                self.ideal_states.append([_x, _y, self.t, _v, _w])
             except Exception:
                 print("[Controller]: Error in F.", self.x, self.y, self.t, self.v, self.w, self.last_u)
             # self.w = w[0]
         if ros_data.success:
             self.x = ros_data.x
             self.y = ros_data.y
+
             if ros_data.t * self.t < 0: # a positive and a negative angle
                 self.t = ros_data.t if min(ros_data.t, self.t) + np.pi/2 < max(ros_data.t, self.t) else self.t
             else: # same sign
                 self.t = ros_data.t if np.abs(ros_data.t-self.t) < np.pi/2 else self.t
+            
+            # Moving average
+            # self.last_n_samples[self.last_n_samples_index] = self.t
+            # self.t = sum(self.last_n_samples)/self.n_samples_m_average
+            # self.last_n_samples_index = (self.last_n_samples_index+1)%self.n_samples_m_average
+            alpha = 1
+            self.t = alpha * self.t + (1 - alpha) * self.old_t
+
+            self.camera_states.append([self.x, self.y, ros_data.t, self.v, self.w])
             if VERBOSE:
                 print("\n[Controller]: Pose: ", ros_data.x, ros_data.y, np.rad2deg(ros_data.t))
         else:
             print("[Controller]: Position failed...")
         # self.old_x = self.x
         # self.old_y = self.y
-        # self.old_t = self.t
+        self.old_t = self.t
         self.localization_time = curr_time
         
+
+    def _cb_imu(self, ros_data):
+        """
+        Callback function for the imu subscriber.
+        """
+        dt = rospy.get_time() - self.imu_time
+        vx = ros_data.linear_acceleration.x * dt
+        vy = ros_data.linear_acceleration.y * dt
+        v = (vx**2 + vy**2)**0.5
+        w = ros_data.angular_velocity.z
+
+        self.v = np.around(v, 3)
+        self.w = np.around(w, 3)
+
+        self.imu_time = rospy.get_time()
 
     def _control(self, ros_data):
         """
@@ -355,14 +446,16 @@ class TheController(DTROS):
                 # Compute last iteration distance to last point
                 self.last_loop = self.X_log
                 last_points = self.X_log
+                print("From X_log: ", repr(last_points))
                 last_points = np.vstack((last_points, np.arange(last_points.shape[1])[::-1]))
 
                 # Delete duplicates on first 5 values of the state,
                 # thus keeping the time to arrive
                 # Delete them because sometimes the LMPC is not synced with the watchtower
-                last_points_unique, indices = np.unique(last_points[:-1], axis=1, return_index=True)
-                last_points = np.vstack((last_points_unique, last_points[-1, indices]))
-                print("[LMPC]: Last points: ", last_points)
+                _, indices = np.unique(last_points[:-1], axis=1, return_index=True)
+                sorted_indices = list(sorted(indices))
+                last_points = last_points[:, sorted_indices]
+                print("[LMPC]: Last points: ", repr(last_points))
 
                 self.loops_with_time.append(last_points)
 
@@ -388,7 +481,7 @@ class TheController(DTROS):
             
             print("[LMPC]: Last time: ", [t.shape[1]*MPC_TIME for t in self.loops_with_time])
         # If it is far enough and using LMPC
-        elif not self.see_all and self.iteration_n >= K+N and np.abs(idx - self.finish_line[-1]) >= K+N and self.loop_n >= 1:
+        elif not self.see_all and self.iteration_n >= K+N+50 and np.abs(idx - self.finish_line[-1]) >= K+N and self.loop_n >= 1:
             # Stop hiding points in nbrs
             print("####################[LMPC]: Stop hiding points in nbrs")
             self.kdtree = spatial.KDTree(self.last_loop[:2, :].T)
@@ -455,13 +548,15 @@ class TheController(DTROS):
         
         if VERBOSE:
             print(f"[LMPC]: r: {r.T}")
+        
+        self.mpc_reference.append(r)
 
         # Angular reference
         tr = r[2,:]
         r = r[:2, :]
 
         #  Control
-        u = MPC(X, r, tr, u_delay0,  1e3, 1e-2, 0, 10)*MAX_SPEED
+        u = MPC(X, r, tr, u_delay0, 1e3, 1e1, 0, 50)*MAX_SPEED # 1e3, 1e-1, 0, 50
         u = np.around([u[0], u[1]], 3)
         print("[LMPC]: u: ", u)
         self.last_u = u
@@ -488,6 +583,7 @@ class TheController(DTROS):
         :param X: Current state.
         :param idx: Index of the closest point in the track.
         """
+        # TODO what is better?
         # distances, indices = self.nbrs.kneighbors([self.last_loop[:2, (idx+N)%self.last_loop.shape[1]].T])
         distances, indices = self.nbrs.kneighbors([self.track[(idx+N)%N_POINTS_MAP, :2].T])
         indices = indices.reshape(-1)
@@ -554,8 +650,11 @@ class TheController(DTROS):
         self.subscriber.shutdown()
         self.pub.unregister()
         print(self.positions)
-        print(self.lmpc_references)
-        print(self.lmpc_references_points)
+        # print(self.lmpc_references)
+        # print("LMPC reference points: ", self.lmpc_references_points)
+        print("MPC reference points: ", self.mpc_reference)
+        # print("Ideal states: ", self.ideal_states)
+        # print("Camera states: ", self.camera_states)
 
 if __name__ == '__main__':
     take_map = GetMap()

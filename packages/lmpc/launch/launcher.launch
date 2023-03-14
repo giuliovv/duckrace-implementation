@@ -2,7 +2,8 @@
 
     <group ns="$(arg veh)">
 
-        <node pkg="lmpc" type="controller.py" name="lmpc" output="screen"/>
+        <!-- <node pkg="lmpc" type="controller.py" name="lmpc" output="screen"/> -->
+        <node pkg="lmpc" type="run_lmpc.py" name="lmpc" output="screen"/>
         <!-- <node pkg="lmpc" type="test_model.py" name="tester" output="screen"/> -->
         <node pkg="lmpc" type="caller.py" name="caller" output="screen"/>
 

@@ -7,7 +7,6 @@ from timeit import default_timer as timer
 import casadi as ca
 import numpy as np
 from scipy import spatial
-from sklearn.neighbors import NearestNeighbors
 
 # ROS
 import rospy, rospkg
@@ -16,7 +15,6 @@ rp = rospkg.RosPack()
 # Msgs
 from std_msgs.msg import Bool
 from lmpc.msg import DuckPose
-from lmpc.msg import Floats
 from duckietown_msgs.msg import WheelsCmdStamped, BoolStamped
 from sensor_msgs.msg import Imu
 
@@ -45,26 +43,8 @@ MAX_SPEED = 1
 MPC_TIME = 0.1
 N_MPC = 10
 N = 4
-# K nearest neighbors
-K = 5
-# N iterations to consider
-i_j = 2
 
-# Moving average (1 = no memory)
-EXP_ALPHA = 1
-
-Qx = 1e3
-Qy = 1e3
-Qt = 1e1
-Qv = 0
-Qw = 1
-Ql = 1e3
-Q2 = 1e4 # 1e4
-Q3 = 1e-5
-
-lmpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", f"LMPC_max03_noborder_slack_orientationweight_inputweight_noretro_k{K}_ij{i_j}_N{N}.casadi") # _orientationdisabled
 mpc_path = os.path.join(rp.get_path("lmpc"), "src", "controllers", "N10_max03_fittedspeed.casadi") #N10_max03_fittedspeed.casadi
-LMPC = ca.Function.load(lmpc_path)
 MPC = ca.Function.load(mpc_path)
 delay = round(0.15/MPC_TIME)
 u_delay0 = ca.DM(np.zeros((2, delay)))
@@ -265,6 +245,11 @@ class TheController(DTROS):
         self.v = 0
         self.w = 0
 
+        self.Q1 = 1e3
+        self.Q2 = 1e1
+        self.Q3 = 0
+        self.R = 50
+
         self.imu_time = rospy.get_time()
 
         self.ideal_states = []
@@ -276,8 +261,6 @@ class TheController(DTROS):
         self.finish_line = None
         self.loop_n = 0
         self.iteration_n = 0
-        self.Js = []
-        self.l = None
         self.plain_loops = []
         self.loops_with_time = []
         self.kdins = spatial.KDTree(inside)
@@ -293,16 +276,8 @@ class TheController(DTROS):
         self.first_loop_len = None
         self.last_loop = None
         self.old_idx = None
-        self.log_slack = []
-        # Distance to point for convex hull inside borders
-        self.more = 20
 
-        # Moving average filter
-        self.n_samples_m_average = 1
-        self.last_n_samples = np.ones((self.n_samples_m_average, 1)) * (-np.pi/2)
-        self.last_n_samples_index = 0
-        self.wait_to_start_idx = 0
-        self.old_t = -np.pi/2
+        self.laps = []
 
         # Timing
         self.starting_time = 0
@@ -359,12 +334,6 @@ class TheController(DTROS):
                 self.t = ros_data.t if min(ros_data.t, self.t) + np.pi/2 < max(ros_data.t, self.t) else self.t
             else: # same sign
                 self.t = ros_data.t if np.abs(ros_data.t-self.t) < np.pi/2 else self.t
-            
-            # Moving average
-            # self.last_n_samples[self.last_n_samples_index] = self.t
-            # self.t = sum(self.last_n_samples)/self.n_samples_m_average
-            # self.last_n_samples_index = (self.last_n_samples_index+1)%self.n_samples_m_average
-            self.t = EXP_ALPHA * self.t + (1 - EXP_ALPHA) * self.old_t if self.old_t * self.t > 0 else self.t
 
             self.camera_states.append([self.x, self.y, ros_data.t, self.v, self.w])
             if VERBOSE:
@@ -439,6 +408,7 @@ class TheController(DTROS):
         if idx_track >= self.finish_line[-1] and idx_track <= self.finish_line[-1]+5 and self.iteration_n >= (20/MPC_TIME):
             self.loop_n += 1
             self.iteration_n = 0
+            self.laps.append(self.X_log)
             print("\n\n\n\t########### [LMPC]: Loop n ", self.loop_n, " ###########\n\n\n")
 
             # If loop 0 has just ended we need to initialize the LMPC
@@ -448,8 +418,7 @@ class TheController(DTROS):
                 self.all_points = self.X_log
                 self.first_loop_len = self.all_points.shape[1]
                 self.all_points = np.vstack((self.all_points, np.arange(self.first_loop_len)[::-1]))
-                self.last_iterations = np.hstack([self.all_points]*i_j)
-                
+                self.last_iterations = self.all_points
                 
                 # Investigate wtf is this
                 if idx+N > self.all_points.shape[1]:
@@ -458,21 +427,16 @@ class TheController(DTROS):
                 # Save first loop
                 self.X_log_origin = self.X_log
 
+                self.Q1 = 1e3
+                self.Q2 = 0
+                self.Q3 = 1
+                self.R = 30
+
             # At start of each LMPC loop reset the values
             if self.loop_n >= 1:
                 # Compute last iteration distance to last point
                 self.last_loop = self.X_log
                 last_points = self.X_log
-                # print("From X_log: ", repr(last_points))
-                last_points = np.vstack((last_points, np.arange(last_points.shape[1])[::-1]))
-
-                # Delete duplicates on first 5 values of the state,
-                # thus keeping the time to arrive
-                # Delete them because sometimes the LMPC is not synced with the watchtower
-                _, indices = np.unique(last_points[:-1], axis=1, return_index=True)
-                sorted_indices = list(sorted(indices))
-                last_points = last_points[:, sorted_indices]
-                # print("[LMPC]: Last points: ", repr(last_points))
 
                 self.loops_with_time.append(last_points)
 
@@ -484,13 +448,10 @@ class TheController(DTROS):
                 X[2] = ca.mod(X[2]+ca.pi, 2*ca.pi)-ca.pi
 
                 # Reset search tree to last loop
-                self.kdtree = spatial.KDTree(self.last_loop[:2, :int((1/MPC_TIME)*10)].T)
+                self.kdtree = spatial.KDTree(self.last_loop[:2].T)
 
                 # Hide the last points of the track to avoid misdirections 
-                self.last_iterations_filtered = self.last_iterations[np.vstack([self.last_iterations[-1] > (20/MPC_TIME)]*6)].reshape(6,-1)
-
-                # Nearest neighbour for LMPC
-                self.nbrs = NearestNeighbors(n_neighbors=K*i_j, algorithm='ball_tree').fit(self.last_iterations_filtered[:2].T)
+                self.last_iterations_filtered = self.last_iterations
 
                 # Flag to update old states and prevent misdirections 
                 self.already_changed = False
@@ -502,38 +463,30 @@ class TheController(DTROS):
                 idx = (idx+1) % self.last_loop.shape[1]
             
             print("[LMPC]: Last time: ", [t.shape[1]*MPC_TIME for t in self.loops_with_time])
-        # If it is far enough and using LMPC
-        elif not self.see_all and self.iteration_n >= K+N+20 and np.abs(idx - self.finish_line[-1]) >= K+N and self.loop_n >= 1:
-            # Stop hiding points in nbrs
-            print("####################[LMPC]: Stop hiding points in nbrs")
-            self.kdtree = spatial.KDTree(self.last_loop[:2, :].T)
-            self.last_iterations_filtered = self.last_iterations
-            self.nbrs = NearestNeighbors(n_neighbors=K*i_j, algorithm='ball_tree').fit(self.last_iterations[:2, :].T)
-            self.see_all = True
 
-        # If the car is about to complete the lap
-        if X[1] > 2.5 and X[1] <= 3 and X[0] > 1 and not self.already_changed and self.loop_n >= 1:
-            print("####################[LMPC]: Get ready to complete the lap")
-            # The first points in the next iteration have time 0
-            self.last_iterations_filtered[-1, :N+K*i_j] = 0
 
-            # The first points in the next iteration are as in the first loop
-            self.last_iterations_filtered[:-1, :N+1] = self.X_log_origin[:, :N+1]
-
-            # After one iteration the angle is +2*pi 
-            self.last_iterations_filtered[2, :N+K*i_j] += 2*np.pi
-
-            # Do not update this values again during the current lap
-            self.already_changed = True
-
-        # Select MPC vs LMPC
+        # Reference
         if self.loop_n == 0:
-            self._mpc(X, idx)
+            if idx+N_MPC+1 < N_POINTS_MAP:
+                r = self.track[idx:idx+N_MPC+1, :].T
+            else:
+                r = self.track[idx:, :]
+                r = np.vstack((r, self.track[:int((idx+N_MPC+1)%N_POINTS_MAP), :]))
+                r = r.T
         else:
-            lmpc_timer_start = timer()
-            self._lmpc(X, idx)
-            lmpc_timer_end = timer()
-            print("[LMPC]: Time: ", lmpc_timer_end - lmpc_timer_start)
+            current_point = X[:2].toarray().reshape(-1)
+            distance = 0
+            increment = 0
+            while distance < (N_MPC*0.05)**2:
+                target = self.last_loop[:2, (idx+N_MPC+3+increment)%self.last_loop.shape[1]].T
+                distance = np.square(target - current_point).sum()
+                increment += 1
+
+            r = np.linspace(current_point, target, N_MPC+3)[2:].T
+            # With angle reference, 0 for testing
+            r = np.vstack([r, [0]*(N_MPC+1)])
+
+        self._mpc(X, r, Q1=self.Q1, Q2=self.Q2, Q3=self.Q3, R=self.R)
 
         # Update open loop model
         # If there has not been a new message during the execution
@@ -551,22 +504,14 @@ class TheController(DTROS):
         # Keep track of iteration number (=time/MPC_TIME)
         self.iteration_n += 1
 
-    def _mpc(self, X, idx):
+    def _mpc(self, X, r, Q1=1e3, Q2=1e1, Q3=0, R=50):
         """
         MPC function.
 
         :param X: Current state.
-        :param idx: Index of the closest point in the track.
+        :param r: Reference trajectory.
         :param current_time: Current time.
         """
-
-        # Reference
-        if idx+N_MPC+1 < N_POINTS_MAP:
-            r = self.track[idx:idx+N_MPC+1, :].T
-        else:
-            r = self.track[idx:, :]
-            r = np.vstack((r, self.track[:int((idx+N_MPC+1)%N_POINTS_MAP), :]))
-            r = r.T
         
         if VERBOSE:
             print(f"[LMPC]: r: {r.T}")
@@ -578,7 +523,7 @@ class TheController(DTROS):
         r = r[:2, :]
 
         #  Control
-        u = MPC(X, r, tr, u_delay0, 1e3, 1e1, 0, 50)*MAX_SPEED # 1e3, 1e-1, 0, 50
+        u = MPC(X, r, tr, u_delay0, Q1, Q2, Q3, R)*MAX_SPEED # 1e3, 1e-1, 0, 50
         u = np.around([u[0], u[1]], 3)
         print("[LMPC]: u: ", u)
         self.last_u = u
@@ -595,92 +540,6 @@ class TheController(DTROS):
             return
 
         self.U_log = np.column_stack((self.U_log, u))
-        # if self.X_log.shape[1] != 0:
-        #     self.X_log = np.column_stack((self.X_log, X*0.4+self.X_log[:, -1]*(1-0.4)))
-        # else:
-        #     self.X_log = np.column_stack((self.X_log, X))
-        self.X_log = np.column_stack((self.X_log, X))
-
-
-    def _lmpc(self, X, idx):
-        """
-        LMPC function.
-        
-        :param X: Current state.
-        :param idx: Index of the closest point in the track.
-        """
-        # TODO what is better?
-        distances, indices = self.nbrs.kneighbors([self.last_loop[:2, (idx+N)%self.last_loop.shape[1]].T])
-        # distances, indices = self.nbrs.kneighbors([self.track[(idx+N)%N_POINTS_MAP, :2].T])
-        indices = indices.reshape(-1)
-
-        self.lmpc_references_points.append(self.last_iterations_filtered[:2, indices])
-
-        # print("[LMPC]: indices: ", self.last_iterations_filtered[:-1, indices])
-
-        # Compute values for convex hull
-        if self.iteration_n == 0:
-            D = self.last_iterations_filtered[:-1, indices]
-            J = self.last_iterations_filtered[-1, indices].reshape(-1)
-        else:
-            S = self.last_iterations_filtered[:, indices]@self.l
-            distances, indices = self.nbrs.kneighbors(np.array(S[:2].T))
-            indices = indices.reshape(-1)
-            D = self.last_iterations_filtered[:-1, indices]
-            J = self.last_iterations_filtered[-1, indices].reshape(-1)
-
-        # print("[LMPC]: D: ", D)
-        self.lmpc_references.append(D[:, 0])
-        
-        self.Js.append(J)
-
-        # Closest point to the current pose in inside line
-        _, border_idx = self.kdins.query(np.array([X[0], X[1]]).reshape(-1))
-        # Margins in track for convex hull
-        margins = np.array([
-            inside[border_idx],
-            inside[(border_idx+N+self.more)%self.ins_len],
-            outside[border_idx],
-            outside[(border_idx+N+int(self.more/4))%self.ins_len],
-            outside[(border_idx+N+self.more)%self.ins_len]]).T
-
-        # Call the LMPC function
-        u, self.l, sx, sy, st, sv, sw, sl = LMPC(X, 
-                                                ca.DM(D[:, :]), 
-                                                ca.DM(J)/600, (np.arange(self.iteration_n, self.iteration_n+N-1)>=self.finish_line[2]).T, 
-                                                margins,
-                                                Qx,
-                                                Qy,
-                                                Qt,
-                                                Qv,
-                                                Qw,
-                                                Ql,
-                                                Q2,
-                                                Q3
-                                                )
-        
-        self.chosen_ref.append(D[:, :]@self.l)
-        self.log_slack.append([sx[0], sy[0], st[0], sv[0], sw[0], sl[0]])
-
-        # Approximate the input
-        u = np.around([u[0], u[1]], 3)
-        if VERBOSE:
-            print("[LMPC]: u: ", u)
-        self.last_u = u
-
-        # Publish the message
-        msg = WheelsCmdStamped()
-        msg.vel_left = u[0]
-        msg.vel_right = u[1]
-
-        try:
-            self.pub.publish(msg)
-        except AttributeError:
-            print("[LMPC]: Publisher not initialized.")
-            return
-
-        # Store last values
-        self.U_log = np.column_stack((self.U_log, u))
         self.X_log = np.column_stack((self.X_log, X))
 
 
@@ -690,16 +549,7 @@ class TheController(DTROS):
         self.pub.publish(WheelsCmdStamped(vel_left=0, vel_right=0))
         self.subscriber.shutdown()
         self.pub.unregister()
-        print(self.positions)
-        print("reference = ", repr(self.lmpc_references))
-        print("params = ", {"N":N, "K":K, "Qx":Qx, "Qy":Qy, "Qt":Qt, "Qv":Qv, "Qw":Qw, "Ql":Ql, "Q2":Q2, "Q3":Q3})
-        print("chosen_ref = ", repr(self.chosen_ref))
-        # print("LMPC reference points: ", self.lmpc_references_points)
-        # print("MPC reference points: ", self.mpc_reference)
-        # print("Ideal states: ", self.ideal_states)
-        # print("Camera states: ", self.camera_states)
-        # print("X_log_origin", repr(self.X_log_origin))
-        # print("Slack: ", repr(self.log_slack))
+        print("laps = ", repr(self.laps))
 
 if __name__ == '__main__':
     take_map = GetMap()

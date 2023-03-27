@@ -39,6 +39,7 @@ catkin_install_python(PROGRAMS
   src/controller.py
   src/caller.py
   src/run_lmpc.py
+  src/run_lmpc_mpc_formulation.py
   src/test_model.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
  )
